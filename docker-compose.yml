@@ -1,0 +1,96 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      
+      # --- KAFKA LISTENERS EXPLANATION ---
+      # KAFKA_LISTENERS: The interfaces/ports the Kafka broker binds to locally inside its container.
+      # - INTERNAL://0.0.0.0:9092 binds the internal port for communication within the Docker network.
+      # - EXTERNAL://0.0.0.0:29092 binds the external port that will be mapped to the host machine.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      
+      # KAFKA_ADVERTISED_LISTENERS: the connection addresses passed back to clients after they connect.
+      # - INTERNAL://kafka:9092 tells other Docker services how to reach this broker.
+      # - EXTERNAL://localhost:29092 tells clients outside Docker (like a local script) how to reach it.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      
+      # Other required configs
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_DB: marketdata
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./init-db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d marketdata"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  producer:
+    build:
+      context: ./producer
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      KAFKA_BROKER: kafka:9092
+      SYMBOL: btcusdt
+
+  consumer:
+    build:
+      context: ./consumer
+    depends_on:
+      kafka:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:9092
+      DB_URL: postgresql://trader:secret@timescaledb:5432/marketdata
+
+  api:
+    build:
+      context: ./api
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DB_URL: postgresql://trader:secret@timescaledb:5432/marketdata
+
+volumes:
+  timescaledb_data:
