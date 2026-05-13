@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Dashboard</title>
+    <!-- Use TradingView Lightweight Charts directly from CDN -->
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --text-light: #c9d1d9;
+            --up-color: #26a69a;
+            --down-color: #ef5350;
+            --header-bg: rgba(255,255,255,0.02);
+            --border: #30363d;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-dark);
+            color: var(--text-light);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Top Header Layout */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 15px 25px;
+            background-color: var(--header-bg);
+            border-bottom: 1px solid var(--border);
+            height: 60px;
+            box-sizing: border-box;
+        }
+
+        .header-left, .header-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .title {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .price {
+            font-size: 1.8rem;
+            font-weight: bold;
+            transition: color 0.3s ease;
+        }
+        .price.up { color: var(--up-color); }
+        .price.down { color: var(--down-color); }
+
+        .stat-label {
+            font-size: 0.9rem;
+            color: #8b949e;
+        }
+
+        .stat-value {
+            font-size: 1.1rem;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+
+        /* Connection Status Dot */
+        .status-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding-left: 10px;
+            border-left: 1px solid var(--border);
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--down-color);
+            transition: all 0.3s ease;
+        }
+        .status-dot.connected {
+            background-color: var(--up-color);
+            box-shadow: 0 0 8px var(--up-color);
+        }
+
+        /* Main Chart Area */
+        #chart-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+        }
+
+        /* Chart sizing ratios */
+        #candle-container {
+            flex: 4;
+            position: relative;
+        }
+
+        #volume-container {
+            flex: 1;
+            position: relative;
+            border-top: 1px solid var(--border);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-left">
+            <div class="title">BTC/USDT Live</div>
+            <div class="price" id="current-price">--</div>
+        </div>
+        <div class="header-right">
+            <div>
+                <span class="stat-label">VWAP</span>
+                <span class="stat-value" id="current-vwap">--</span>
+            </div>
+            <div class="status-container">
+                <span class="stat-label" id="status-text">Disconnected</span>
+                <div class="status-dot" id="status-dot"></div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="chart-container">
+        <div id="candle-container"></div>
+        <div id="volume-container"></div>
+    </div>
+
+    <script>
+        const API_BASE = "http://localhost:8000";
+        const WS_URL = "ws://localhost:8000/ws/live";
+        const SYMBOL = "BTCUSDT";
+
+        // DOM elements
+        const priceEl = document.getElementById("current-price");
+        const vwapEl = document.getElementById("current-vwap");
+        const statusDot = document.getElementById("status-dot");
+        const statusText = document.getElementById("status-text");
+        
+        const candleContainer = document.getElementById("candle-container");
+        const volumeContainer = document.getElementById("volume-container");
+
+        // Base Chart Configuration
+        const chartOptions = {
+            layout: {
+                background: { type: 'solid', color: 'transparent' },
+                textColor: '#d1d4dc',
+            },
+            grid: {
+                vertLines: { visible: false },
+                horzLines: { visible: false },
+            },
+            timeScale: {
+                timeVisible: true,
+                borderColor: '#30363d',
+            },
+            rightPriceScale: {
+                borderColor: '#30363d',
+            },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
+            }
+        };
+
+        // Initialize Candlestick Chart
+        const candleChart = LightweightCharts.createChart(candleContainer, chartOptions);
+        
+        // Hide time axis labels on the top chart to avoid visual duplication
+        candleChart.timeScale().applyOptions({ visible: false });
+
+        const candleSeries = candleChart.addCandlestickSeries({
+            upColor: '#26a69a',
+            downColor: '#ef5350',
+            borderVisible: false,
+            wickUpColor: '#26a69a',
+            wickDownColor: '#ef5350',
+        });
+
+        // Initialize Volume Chart
+        // Make the price scale a histogram format, and eliminate upper/lower margin constraints naturally.
+        const volumeChart = LightweightCharts.createChart(volumeContainer, chartOptions);
+        const volumeSeries = volumeChart.addHistogramSeries({
+            color: '#26a69a',
+            priceFormat: { type: 'volume' },
+            priceScaleId: '', 
+            scaleMargins: { top: 0, bottom: 0 },
+        });
+
+        // -----------------------------------------------------------------------------------------
+        // Axis Synchronization logic
+        // -----------------------------------------------------------------------------------------
+        let isSyncing = false;
+
+        // Sync logical ranges (scrolling / dragging)
+        candleChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+            if (!isSyncing && range) {
+                isSyncing = true;
+                volumeChart.timeScale().setVisibleLogicalRange(range);
+                isSyncing = false;
+            }
+        });
+
+        volumeChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+            if (!isSyncing && range) {
+                isSyncing = true;
+                candleChart.timeScale().setVisibleLogicalRange(range);
+                isSyncing = false;
+            }
+        });
+
+        // Sync crosshair tracking
+        candleChart.subscribeCrosshairMove(param => {
+            if (!param.time || param.point === undefined) {
+                volumeChart.clearCrosshairPosition();
+            } else {
+                volumeChart.setCrosshairPosition(0, param.time, volumeSeries);
+            }
+        });
+
+        volumeChart.subscribeCrosshairMove(param => {
+            if (!param.time || param.point === undefined) {
+                candleChart.clearCrosshairPosition();
+            } else {
+                candleChart.setCrosshairPosition(0, param.time, candleSeries);
+            }
+        });
+
+        // Dynamic resizing listener
+        window.addEventListener('resize', () => {
+            candleChart.applyOptions({ width: candleContainer.clientWidth, height: candleContainer.clientHeight });
+            volumeChart.applyOptions({ width: volumeContainer.clientWidth, height: volumeContainer.clientHeight });
+        });
+
+        // -----------------------------------------------------------------------------------------
+        // Time Conversion Explanation
+        // -----------------------------------------------------------------------------------------
+        // The time conversion from ISO string to Unix seconds is necessary because 
+        // TradingView lightweight-charts strictly expects the `time` property for default timescale 
+        // configurations to be a Unix timestamp in seconds (not milliseconds like native Date.getTime()).
+        const isoToUnixSeconds = (isoString) => new Date(isoString).getTime() / 1000;
+
+        // Header Update helper functions
+        const refreshHeader = (bar) => {
+            priceEl.innerText = bar.close.toFixed(2);
+            priceEl.className = `price ${bar.close >= bar.open ? 'up' : 'down'}`;
+            if (bar.vwap != null) {
+                vwapEl.innerText = parseFloat(bar.vwap).toFixed(2);
+            }
+        };
+
+        // -----------------------------------------------------------------------------------------
+        // Fetch Historical Data on Page Load
+        // -----------------------------------------------------------------------------------------
+        // Why we load historical data on page load: 
+        // If we strictly rely on WebSockets, the chart will be entirely empty for minutes until
+        // new bars arrive. Providing historical context instantly pre-populates the chart so 
+        // quantitative and visual data analysis can happen immediately, and provides a backdrop 
+        // for live updates.
+        let isHistoricalDataLoaded = false;
+
+        async function loadHistoricalData() {
+            try {
+                const to = new Date();
+                const from = new Date(to.getTime() - (2 * 60 * 60 * 1000)); // 2 hours ago
+                
+                // Fetch up to 100 bars from REST API locally
+                const url = `${API_BASE}/ohlcv?symbol=${SYMBOL}&interval=1m&from=${from.toISOString()}&to=${to.toISOString()}&limit=100`;
+                const res = await fetch(url);
+                const data = await res.json();
+
+                const candleData = [];
+                const volumeData = [];
+
+                data.forEach(bar => {
+                    const time = isoToUnixSeconds(bar.time);
+                    const isUp = bar.close >= bar.open;
+                    
+                    candleData.push({
+                        time, open: bar.open, high: bar.high, low: bar.low, close: bar.close
+                    });
+                    
+                    volumeData.push({
+                        time, value: bar.volume, color: isUp ? '#26a69a80' : '#ef535080'
+                    });
+                });
+
+                // Batch insert into series graphs
+                candleSeries.setData(candleData);
+                volumeSeries.setData(volumeData);
+                
+                if (data.length > 0) refreshHeader(data[data.length - 1]);
+                isHistoricalDataLoaded = true;
+
+            } catch (err) {
+                console.error("Failed to load history data:", err);
+            }
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // Live WebSocket Architecture
+        // -----------------------------------------------------------------------------------------
+        let ws;
+        function connectLiveStream() {
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                statusDot.classList.add('connected');
+                statusText.innerText = "Connected";
+            };
+
+            ws.onmessage = (event) => {
+                // Ignore any inbound payloads if history hasn't been backfilled
+                if (!isHistoricalDataLoaded) return;
+                
+                const bar = JSON.parse(event.data);
+                
+                // Ignore internal health pings
+                if (bar.type === "ping") return;
+
+                const time = isoToUnixSeconds(bar.time);
+                const isUp = bar.close >= bar.open;
+
+                // -----------------------------------------------------------------------------------------
+                // Why update() handles both new bars and updates to current bar
+                // -----------------------------------------------------------------------------------------
+                // `series.update()` inside lightweight-charts intelligently checks the timestamp you pass.
+                // If `time` equals the newest timestamp already drawn, it will just continuously 
+                // mutate that single existing bar (meaning volumes fluctuate, the candle wick gets larger if high was broken, etc.).
+                // If `time` is greater than the newest timestamp, it effortlessly natively appends it as a new distinct bar sequence.
+                candleSeries.update({
+                    time, open: bar.open, high: bar.high, low: bar.low, close: bar.close
+                });
+                
+                volumeSeries.update({
+                    time, value: bar.volume, color: isUp ? '#26a69a80' : '#ef535080'
+                });
+
+                refreshHeader(bar);
+            };
+
+            ws.onerror = (err) => {
+                console.error("WebSocket transport error:", err);
+            };
+
+            ws.onclose = () => {
+                statusDot.classList.remove('connected');
+                statusText.innerText = "Disconnected";
+                // Attempt to auto re-establish the connection after 3 seconds
+                setTimeout(connectLiveStream, 3000);
+            };
+        }
+
+        // Initialize application flow
+        async function boot() {
+            // First measure and enforce strict resizing limits for the charts visually
+            window.dispatchEvent(new Event('resize'));
+            
+            // Second load historical database snapshots bridging gap
+            await loadHistoricalData();
+            
+            // Set up stream subscriber handling push payloads natively
+            connectLiveStream();
+        }
+
+        boot();
+    </script>
+</body>
+</html>
